@@ -1,0 +1,746 @@
+import requests
+import sqlite3
+import datetime
+import time
+from datetime import timezone
+import math
+from web3 import Web3
+import asyncio
+from decimal import Decimal
+import json
+import aiohttp
+from web3 import AsyncWeb3, AsyncHTTPProvider
+from aiohttp import ClientSession
+import aiofiles
+from concurrent.futures import ThreadPoolExecutor
+from web3.middleware import geth_poa_middleware
+import concurrent.futures
+import aiosqlite
+from concurrent.futures import ThreadPoolExecutor
+from dotenv import load_dotenv
+import os
+from datetime import datetime, timezone
+from web3 import HTTPProvider, Web3
+from web3 import Web3 as AsyncWeb3
+from web3.providers.async_rpc import AsyncHTTPProvider
+from web3 import Web3, HTTPProvider
+from eth_utils import to_checksum_address
+from web3.gas_strategies.time_based import construct_time_based_gas_price_strategy
+from web3 import Web3, WebsocketProvider
+import websockets
+from web3.utils.address import to_checksum_address
+import decimal
+
+
+
+
+# 创建一个字典作为缓存
+cache = {}
+# 定义缓存和时间戳的全局变量
+new_pools_cache = None
+new_pools_timestamp = None
+executor = concurrent.futures.ThreadPoolExecutor()
+# 在函数外部，也就是在全局作用域中声明变量
+router_contract = None
+web3 = None
+session = None
+#加载环境变量
+load_dotenv()
+
+WBNB_CONTRACT_ADDRESS = "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c"  # WBNB的合约地址
+with open("WBNB_ABI.json") as f:
+    WBNB_ABI = json.load(f)
+# 从环境变量中获取节点URL
+provider_url = os.getenv("NODE_URL")  
+# BSC节点
+NODE_URL = os.getenv('NODE_URL')
+API_KEY = os.getenv('API_KEY')
+async def initialize_web3():
+    global web3
+    web3 = Web3(AsyncHTTPProvider(NODE_URL))
+    print(web3.is_connected())
+
+# 创建一个Web3实例
+provided_web3 = Web3(HTTPProvider(NODE_URL))
+
+# 现在你可以使用这个实例上的 to_wei 和 from_wei 方法了
+wei_value = provided_web3.to_wei(1, 'ether')  # 在BSC网络中，'ether'单位等价于'BNB'单位
+bnb_value = provided_web3.from_wei(wei_value, 'ether')
+
+with open('router_abi.json') as f:
+    router_abi = json.load(f)
+
+with open('ERC20_abi.json') as f:
+    ERC20_abi = json.load(f)
+# 创建合约实例
+router_contract = provided_web3.eth.contract(address='0x10ED43C718714eb63d5aA57B78B54704E256024E', abi=router_abi)
+
+# 估算Gas的异步函数，定义在全局范围
+async def estimate_gas_async(buy_amount, token_address, my_address, nonce):
+    print("Starting estimate_gas_async...")
+    if router_contract is None:
+        print("Initializing router contract...")
+        await initialize_router_contract()
+        print("Router contract initialized.")
+
+    buy_amount_in_wei = int(provided_web3.to_wei(buy_amount, 'ether'))
+
+    with ThreadPoolExecutor() as executor:
+        try:
+            print("Estimating gas...")
+            estimated_gas = await asyncio.get_event_loop().run_in_executor(
+                executor,
+                router_contract.functions.swapExactETHForTokens(
+                    buy_amount_in_wei,
+                    [Web3.to_checksum_address(token_address), Web3.to_checksum_address('0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c')],
+                    my_address,
+                    int(time.time()) + 1000
+                ).estimateGas,
+                {'from': my_address, 'value': buy_amount_in_wei, 'nonce': nonce, 'gas': 4500000}  # increase gas limit
+            )
+            print(f"Estimated gas: {estimated_gas}")
+            return estimated_gas
+        except Exception as e:
+            print(f"Error occurred while estimating gas: {e}")
+
+
+
+
+# PancakeSwap V2 Router address
+router_address = "0x10ED43C718714eb63d5aA57B78B54704E256024E"
+checksum_address = to_checksum_address(router_address)
+
+
+private_key = os.getenv('PRIVATE_KEY')
+wallet_address = os.getenv('wallet_address')
+# 将钱包地址赋值给 my_address 变量
+my_address = wallet_address
+
+
+async def get_new_pools(session):
+    print("Starting get_new_pools...")  # 函数开始
+    global new_pools_cache, new_pools_timestamp
+    # 检查缓存是否存在并且是否在有效期内
+    if new_pools_cache and new_pools_timestamp and time.time() - new_pools_timestamp < 60:
+        print("Returning cached pool data...")  # 返回缓存数据
+        return new_pools_cache  # 如果缓存有效，直接返回缓存的数据
+    else:
+        print("Fetching new pool data...")  # 开始获取新的池数据
+        # 如果缓存不存在或已过期，重新发起API请求获取新的数据
+        gecko_response = await session.get(
+            "https://api.geckoterminal.com/api/v2/networks/bsc/new_pools",
+            headers={'accept': 'application/json'},
+            params={'include': 'base_token,quote_token'}
+        )
+        new_pools_cache = await gecko_response.json()  # 更新缓存的数据
+        new_pools_timestamp = time.time()  # 更新缓存的时间戳
+        print("Fetched and cached new pool data.")  # 获取并缓存新的池数据
+        return new_pools_cache
+    
+from eth_utils import to_checksum_address
+
+async def initialize_router_contract():
+    print("Starting initialize_router_contract...")  # 函数开始
+    global router_contract
+    global web3
+    try:
+        # 创建一个AsyncWeb3实例
+        await initialize_web3() # 确保 session 和 web3 被初始化了
+        print(f'web3 is: {web3}')  # 添加打印语句
+
+        abi_path = 'router_abi.json'  # 替换为你的ABI JSON文件的实际路径
+        abi = await load_abi(abi_path)
+
+        # Parse the ABI using json
+        router_abi = json.loads(abi)
+
+        router_contract = web3.eth.contract(address=to_checksum_address(router_address), abi=router_abi)
+        print(f'router_contract is: {router_contract}')  # 添加打印语句
+        print("Router contract initialized.")  # Router合约初始化成功
+    except Exception as e:
+        print(f'Exception occurred: {e}')  # 打印出可能出现的异常
+
+
+
+        
+# Define the load_abi function
+async def load_abi(abi_path):
+    print("Starting load_abi...")  # 函数开始
+    try:
+        async with aiofiles.open(abi_path, mode='r') as f:
+            abi_string = await f.read()
+            print("ABI loaded successfully.")  # ABI加载成功
+            return json.loads(abi_string) # 这里将读取和解析ABI两步合并在了一起
+    except Exception as e:
+        print(f"Exception occurred while loading ABI: {e}")  # 打印出可能出现的异常
+    
+async def initialize_program():
+    print("Starting initialize_program...")  # 函数开始
+    global web3
+    await initialize_router_contract()
+
+    conn = await aiosqlite.connect("tokens.db")  # 用你的数据库文件路径替换"your_database_file.db"
+    c = await conn.cursor()
+
+    while True:
+        for _ in range(30):
+            print("Fetching new pools...")  # 开始获取新池数据
+            gecko_data = await get_new_pools(session)  # 使用 get_new_pools 函数获取数据
+
+            print("Checking and inserting token data...")  # 开始检查并插入代币数据
+            await check_and_insert_token_data(gecko_data, c, web3)
+
+            await conn.commit()
+            await asyncio.sleep(2)
+
+        await asyncio.sleep(60 - 30 * 2)
+
+    await conn.close()
+    await close_web3_session()
+    print("Program initialized successfully.")  # 程序初始化成功
+
+# 获取 gas 价格
+def get_gas_price_sync():
+    print("Starting get_gas_price_sync...")  # 函数开始
+    try:
+        response = requests.get(f'https://api.bscscan.com/api?module=gastracker&action=gasoracle&apikey={API_KEY}')
+        response_json = response.json()
+        print(f"BscScan API response: {response_json}")  # 打印BscScan API的响应
+        price = int(response_json['result']['ProposeGasPrice'])
+        print(f"Gas price obtained: {price}")  # 获取gas价格成功
+        return price
+    except Exception as e:
+        print(f"Exception occurred while getting gas price: {e}")  # 打印出可能出现的异常
+        return None
+
+async def get_gas_price_async():
+    print("Starting get_gas_price_async...")  # 函数开始
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, get_gas_price_sync)
+
+# 初始化同步Web3对象
+def init_sync_web3(url: str):
+    print("Starting init_sync_web3...")  # 函数开始
+    try:
+        sync_provider = HTTPProvider(url)
+        sync_web3 = Web3(sync_provider)
+        print("Sync web3 initialized successfully.")  # Sync Web3初始化成功
+        return sync_web3
+    except Exception as e:
+        print(f"Exception occurred while initializing sync web3: {e}")  # 打印出可能出现的异常
+
+# 初始化异步Web3对象
+async def init_async_web3(url: str):
+    print("Starting init_async_web3...")  # 函数开始
+    async with ClientSession() as session:
+        try:
+            async_web3 = AsyncWeb3(AsyncHTTPProvider(url))
+            print("Async web3 initialized successfully.")  # Async Web3初始化成功
+            return async_web3
+        except Exception as e:
+            print(f"Exception occurred while initializing async web3: {e}")  # 打印出可能出现的异常
+
+# 获取WBNB余额
+async def get_wbnb_balance_async(web3, address):
+    print("Starting get_wbnb_balance_async...")  # 函数开始
+    loop = asyncio.get_event_loop()  # 获取事件循环
+    executor = ThreadPoolExecutor()  # 创建线程池执行器
+    try:
+        # 创建WBNB代币合约对象
+        wbnb_contract = web3.eth.contract(address=WBNB_CONTRACT_ADDRESS, abi=WBNB_ABI)
+        # 通过代币合约对象获取WBNB余额
+        balance = await loop.run_in_executor(executor, wbnb_contract.functions.balanceOf(address).call)
+        print(f"WBNB balance obtained: {balance / 10 ** 18}")  # 获取WBNB余额成功
+        return balance / 10 ** 18
+    except Exception as e:
+        print(f"Exception occurred while getting WBNB balance: {e}")  # 打印出可能出现的异常
+
+async def print_balances():
+    print("Starting print_balances...")  # 函数开始
+    url = os.getenv('NODE_URL')  # 从环境变量中读取节点URL
+    address = os.getenv('wallet_address')  # 从环境变量中读取钱包地址
+
+    # 初始化Web3对象
+    web3 = Web3(Web3.HTTPProvider(url))
+    web3.middleware_onion.inject(geth_poa_middleware, layer=0)
+    print("Web3 initialized.")  # Web3初始化成功
+
+    # 获取并打印WBNB余额
+    wbnb_balance = await get_wbnb_balance_async(web3, address)
+    print(f"The WBNB balance is {wbnb_balance} WBNB")
+    print("Print_balances function completed successfully.")  # 函数成功结束
+
+async def get_pool_info(session, address):
+    print("Starting get_pool_info...")  # 函数开始
+    # 如果地址在缓存中，直接返回缓存中的数据
+    if address in cache:
+        print("Data fetched from cache.")  # 从缓存中获取数据成功
+        return cache[address]
+
+    async with session.get(
+        f"https://api.geckoterminal.com/api/v2/networks/bsc/pools/{address}",
+        headers={'accept': 'application/json'},
+    ) as response:
+        data = await response.json()
+        if 'data' in data and 'attributes' in data['data']:
+            # 将数据存储到缓存中
+            cache[address] = data['data']['attributes']
+            print("Data fetched and stored in cache successfully.")  # 获取并存储数据成功
+            return data['data']['attributes']
+        else:
+            print(f"Error: cannot find 'data' and 'attributes' in response for token {address}")
+            return None
+    print("Get_pool_info function completed successfully.")  # 函数成功结束
+
+async def print_pool_info(session, token_info):
+    print("Starting print_pool_info...")  # 函数开始
+    token_address = token_info['attributes']['address']
+    pool_info = await get_pool_info(session, token_address)
+    print(pool_info)
+    print("Print_pool_info function completed successfully.")  # 函数成功结束
+
+async def get_pool_info_async(session, address):
+    print("Starting get_pool_info_async...")  # 函数开始
+    if address in cache:
+        print("Data fetched from cache.")  # 从缓存中获取数据成功
+        return cache[address]
+    else:
+        url = f"https://api.geckoterminal.com/api/v2/networks/bsc/pools/{address}"
+        async with session.get(url, headers={'accept': 'application/json'}) as response:
+            if response.status != 200:
+                print(f"Error: Got status code {response.status} for URL {url}")
+                return None
+            data = await response.json()
+            if 'data' in data and 'attributes' in data['data']:
+                # 在返回数据之前，先将其存储到缓存中
+                cache[address] = data['data']['attributes']
+                print("Data fetched and stored in cache successfully.")  # 获取并存储数据成功
+                return data['data']['attributes']
+            else:
+                print(f"Error: cannot find 'data' and 'attributes' in response for URL {url}")
+                print(data)
+                return None
+    print("Get_pool_info_async function completed successfully.")  # 函数成功结束
+
+
+
+async def goplus_request_v1(session, contract_address):
+    print("Starting goplus_request_v1...")  # 函数开始
+    async with session.get(
+        f"https://api.gopluslabs.io/api/v1/token_security/56?contract_addresses={contract_address}"
+    ) as response:
+        data = await response.json()
+    print("Goplus request completed.")  # Goplus请求完成
+    return data
+
+
+
+async def check_and_insert_token_data(gecko_data, db, session, provided_web3):
+        print("Starting check_and_insert_token_data...")  # 函数开始
+        for item in gecko_data['data']:
+            pool = item['attributes']
+            contract_address = pool['address']
+
+            pool_info = await get_pool_info_async(session, contract_address)
+            print(f"Pool info obtained for address: {contract_address}.")  # 获取池信息完成
+
+            gas_price = 20  # Gas price in Gwei
+
+            pool_created_at = pool_info['pool_created_at']
+            base_token_price_usd = pool_info['base_token_price_usd']
+            liquidity = float(pool_info['reserve_in_usd'])  # get liquidity from geckoterminal API
+
+            print(f"Liquidity of token {contract_address}: {liquidity} USDT")
+
+            goplus_data_v1 = await goplus_request_v1(session, contract_address)
+            print("Goplus request completed.")  # Goplus请求完成
+            
+
+            token_security_data = goplus_data_v1['result'].get(contract_address, {})
+            print(f"Pool created at (string): {pool_created_at}")  # 打印原始字符串
+            deployed_time_utc = datetime.strptime(pool_created_at, '%Y-%m-%dT%H:%M:%SZ').replace(tzinfo=timezone.utc)
+            print(f"Pool created at (datetime): {deployed_time_utc}")  # 打印转换后的datetime对象
+            deploy_time_difference = math.floor((datetime.now(timezone.utc) - deployed_time_utc).total_seconds() / 60)
+            print(f"Time difference (minutes): {deploy_time_difference}")  # 打印时间差
+
+            print(f"Deployed time in UTC: {deploy_time_difference} minutes")
+            print(f"Base token price in USD: {base_token_price_usd}")
+
+            buy_tax = 0 if token_security_data.get('buy_tax', '') == '' else float(token_security_data['buy_tax'])
+            is_honeypot = token_security_data.get('is_honeypot', '0') == '1'
+            can_take_back_ownership = token_security_data.get('can_take_back_ownership', '0') == '1'
+            is_blacklisted = token_security_data.get('is_blacklisted', '0') == '1'
+            is_whitelisted = token_security_data.get('is_whitelisted', '0') == '1'
+            is_anti_whale = token_security_data.get('is_anti_whale', '0') == '1'
+            cannot_sell_all = token_security_data.get('cannot_sell_all', '0') == '1'
+            ownership_renounced = token_security_data.get('ownership_renounced', '0') == '1'
+            mint_functions = token_security_data.get('mint_functions', '0') == '1'
+            burn_functions = token_security_data.get('burn_functions', '0') == '1'
+            private_functions = token_security_data.get('private_functions', '0') == '1'
+            internal_transfer = token_security_data.get('internal_transfer', '0') == '1'
+
+            if liquidity < 500:
+                print(f"Token {contract_address} is high risk due to low liquidity!")
+                await db.execute(
+                    'INSERT INTO high_risk_tokens VALUES (?,?,?,?,?,?,?,?)',
+                    (contract_address, str(int(is_honeypot)), 
+                    str(buy_tax), str(int(can_take_back_ownership)),
+                    str(int(is_blacklisted)), str(int(is_whitelisted)),
+                    str(int(is_anti_whale)), str(int(cannot_sell_all)))
+                )
+                await db.commit()
+            elif (
+                liquidity >= 500 and
+                not is_honeypot and
+                buy_tax <= 5 and
+                not can_take_back_ownership and
+                not is_blacklisted and
+                not is_whitelisted and
+                not is_anti_whale and
+                not cannot_sell_all and
+                not ownership_renounced and
+                not mint_functions and
+                not burn_functions and
+                not private_functions and
+                not internal_transfer and
+                deploy_time_difference >= 5
+            ):
+                asyncio.create_task(buy_token(contract_address, provided_web3, my_address, private_key, gas_price))  # Start the buy_token coroutine
+
+                await db.execute(
+                    'INSERT INTO safe_tokens VALUES (?)',
+                    (contract_address,)
+                )
+                await db.commit()
+                print(f"Check and insert completed for token {contract_address}.")  # 检查和插入完成
+        print("Check_and_insert_token_data function completed successfully.")  # 函数成功结束
+
+
+# 定义买入函数
+async def buy_token(provided_web3, token_address, my_address, private_key, gas_price, future):
+    print("成功获取代币价格。")
+    print("开始执行buy_token函数...")
+    print("提供的web3: ", provided_web3)
+    # 获取代币信息，包括token_info字典
+    async with aiohttp.ClientSession() as session:
+        token_info = await get_pool_info_async(session, token_address)
+    token_price = await get_token_price(token_info)
+    slippage = 0.01  # 设置滑点
+
+    gas_price = await get_gas_price_async()
+    if gas_price is None:
+        print("获取gas价格失败。中止buy_token函数。")
+        return None
+    gas_price_wei = provided_web3.to_wei(gas_price, 'gwei')
+    
+    try:
+        router_contract_address = to_checksum_address('0x10ED43C718714eb63d5aA57B78B54704E256024E')
+        router_contract = provided_web3.eth.contract(address=router_contract_address, abi=router_abi)
+
+        # 创建WBNB合约对象
+        wbnb_contract = provided_web3.eth.contract(address=WBNB_CONTRACT_ADDRESS, abi=WBNB_ABI)
+        
+
+        url = os.getenv('NODE_URL')
+        sync_web3 = Web3(HTTPProvider(url))
+        sync_web3.middleware_onion.inject(geth_poa_middleware, layer=0)
+
+        print("获取WBNB余额...")
+        wbnb_balance = wbnb_contract.functions.balanceOf(my_address).call()  # 获取WBNB余额
+        wbnb_balance_eth = provided_web3.from_wei(wbnb_balance, 'ether')  # 将余额从 Wei 转换为以太单位
+        wbnb_balance_eth = decimal.Decimal(str(wbnb_balance_eth))  # 将其转换为 decimal.Decimal 类型
+        print("WBNB余额:", wbnb_balance_eth)
+        buy_amount = wbnb_balance_eth * decimal.Decimal('0.1')
+        buy_amount_wei = provided_web3.to_wei(buy_amount, 'ether')
+        print("购买金额（WBNB）:", buy_amount)
+
+        # 授权PancakeSwap交易路由器使用你的WBNB
+        print("准备授权交易...")
+        nonce = sync_web3.eth.get_transaction_count(my_address, "latest")
+        wbnb_approve_data = wbnb_contract.encodeABI(fn_name="approve", args=[router_contract_address, buy_amount_wei])
+        wbnb_approve_txn = {
+            'from': my_address,
+            'nonce': nonce,
+            'gas': 4500000,
+            'gasPrice': gas_price_wei,
+            'to': WBNB_CONTRACT_ADDRESS,
+            'data': wbnb_approve_data,
+            'chainId': 56
+        }
+        wbnb_approve_signed_txn = sync_web3.eth.account.sign_transaction(wbnb_approve_txn, private_key)
+        print("发送WBNB授权交易...")
+        wbnb_approve_tx_hash = provided_web3.eth.send_raw_transaction(wbnb_approve_signed_txn.rawTransaction)
+        print("已发送WBNB授权交易。交易哈希：", wbnb_approve_tx_hash.hex())
+
+        # 等待交易回执
+        print("等待交易回执...")
+        try:
+            txn_receipt = provided_web3.eth.wait_for_transaction_receipt(wbnb_approve_tx_hash)
+            print("授权交易回执：", txn_receipt)
+        except Exception as e:
+            print("授权交易失败。原因：", e)
+            return None
+
+        # 计算最低接收数量（考虑滑点）
+        min_tokens = token_price * buy_amount * (1 - slippage)
+
+        # 生成交易数据
+        path = [WBNB_CONTRACT_ADDRESS, token_address]  # 交易路径
+        deadline = int(time.time()) + 1000  # 设置交易截止时间
+
+        swap_params = {
+            'amountIn': buy_amount_wei,
+            'amountOutMin': min_tokens,
+            'path': path,
+            'to': my_address,
+            'deadline': deadline
+        }
+        swap_data = router_contract.encodeABI(fn_name="swapExactETHForTokens", args=swap_params.values())
+
+        # 获取交易的nonce
+        nonce = sync_web3.eth.get_transaction_count(my_address, "latest")
+
+        # 创建交易对象
+        swap_txn = {
+            'from': my_address,
+            'nonce': nonce,
+            'gas': 4500000,
+            'gasPrice': gas_price_wei,
+            'to': router_contract_address,
+            'value': buy_amount_wei,
+            'data': swap_data,
+            'chainId': 56
+        }
+        # 使用私钥签名交易
+        signed_txn = sync_web3.eth.account.sign_transaction(swap_txn, private_key)
+
+        # 发送交易
+        print("发送交易...")
+        tx_hash = provided_web3.eth.send_raw_transaction(signed_txn.rawTransaction)
+        print("已发送交易。交易哈希：", tx_hash.hex())
+
+        # 等待交易回执
+        print("等待交易回执...")
+        try:
+            txn_receipt = wait_for_receipt(provided_web3, tx_hash, poll_interval=1)  # 使用自定义的wait_for_receipt函数
+            print("交易回执：", txn_receipt)
+        except Exception as e:
+            print("交易失败。原因：", e)
+            return None
+    except Exception as e:
+        print("buy_token函数执行失败。原因：", e)
+        return None
+
+    print("buy_token函数执行成功。")
+    return tx_hash.hex()
+
+# 等待交易收据函数
+def wait_for_receipt(web3, tx_hash, poll_interval):
+    """等待交易收据，并返回收据"""
+    while True:
+        tx_receipt = web3.eth.getTransactionReceipt(tx_hash)
+        if tx_receipt:
+            return tx_receipt
+        time.sleep(poll_interval)
+
+
+
+
+async def api_get_token_price(address):
+    print("Starting api_get_token_price function...")  # 开始函数
+
+    async with aiohttp.ClientSession() as session:
+        url = f"https://api.geckoterminal.com/api/v2/networks/bsc/pools/{address}"
+        print(f"URL: {url}")  # 打印访问的URL
+
+        async with session.get(url) as response:
+            print(f"Response status: {response.status}")  # 打印HTTP响应的状态码
+
+            if response.status != 200:  # 检查HTTP响应的状态码
+                print(f"Error: Received status code {response.status} when trying to get price of token {address}")
+                return None  # 如果状态码不是200，就返回None
+
+            response_text = await response.text()
+            print(f"Response text: {response_text}")  # 打印HTTP响应的内容
+
+            response_data = json.loads(response_text)
+            return response_data['data']['attributes']
+
+
+async def get_token_price(token_info):
+    print("Starting get_token_price function...")  # 开始函数
+
+    if 'id' not in token_info:
+        print("Error: 'id' key not found in token_info")
+        return None
+
+    # 从token_info字典中获取代币地址
+    token_address = token_info['id'].split('_')[1]
+    print(f"Token address: {token_address}")  # 打印获取到的代币地址
+
+    # 调用api_get_token_price获取实时价格
+    print("Calling api_get_token_price...")
+    price_info = await api_get_token_price(token_address)
+    print(f"Price info: {price_info}")  # 打印从api_get_token_price返回的价格信息
+
+    if price_info is None:  # 如果api_get_token_price返回了None，就意味着获取价格失败了
+        print(f"Error: Failed to get price of token {token_address}")
+        return None  # 在这种情况下，你可以返回None，或者返回一个特殊的值，比如-1
+
+    print("Token price fetched successfully.")  # 完成函数
+    return float(price_info['base_token_price_usd'])
+
+
+
+async def monitor_and_sell_token(provided_web3, my_address, private_key, token_address, buy_price, token_amount):
+    print("Starting monitor_and_sell_token function...")  # 开始函数
+    # 设定涨跌阈值
+    price_increase_threshold = buy_price * 1.1
+    price_decrease_threshold = buy_price * 0.95
+
+    while True:
+        # 获取当前代币价格
+        print("Fetching token price...")  # 获取价格前打印信息
+        current_price = await get_token_price(token_address)
+
+        # 判断价格是否达到了卖出阈值
+        if price_increase_threshold * 0.99 <= current_price <= price_increase_threshold * 1.01 or current_price <= price_decrease_threshold:
+            print(f"Price threshold reached. Selling {token_amount} tokens at price {current_price}.")  # 当价格达到阈值时打印信息
+            # 将token数量转换为整数，并将其转换为最小单位（wei）
+            token_amount_wei = provided_web3.to_wei(token_amount, 'ether')  
+            # 这里执行卖出操作
+            await sell_token(provided_web3, token_address, token_amount_wei, my_address, private_key, get_gas_price_async)
+            break
+        # 暂停2秒
+        await asyncio.sleep(2)
+
+
+async def sell_token(provided_web3, token_address, sell_amount_wei, my_address, private_key, gas_price):
+    print("Starting sell_token function...")
+    slippage = 0.04  # 定义滑点
+
+    router_contract_address = to_checksum_address('0x10ED43C718714eb63d5aA57B78B54704E256024E')  
+    router_contract = provided_web3.eth.contract(address=router_contract_address, abi=router_abi)  
+
+    token_contract = provided_web3.eth.contract(address=token_address, abi=ERC20_abi)
+    
+    allowance = token_contract.functions.allowance(my_address, router_contract_address).call()
+    if allowance < sell_amount_wei:
+        nonce = provided_web3.eth.get_transaction_count(my_address, 'pending')
+        approve_txn = token_contract.functions.approve(router_contract_address, sell_amount_wei * 2).buildTransaction({
+            'from': my_address,
+            'nonce': nonce,
+            'gas': 4500000,
+            'chainId': 56
+        })
+        estimated_gas = provided_web3.eth.estimate_gas(approve_txn)
+        estimated_gas = int(estimated_gas * 1.1)
+        approve_txn['gas'] = estimated_gas
+        signed_approve_txn = provided_web3.eth.account.sign_transaction(approve_txn, private_key)
+        approve_txn_hash = await provided_web3.eth.send_raw_transaction(signed_approve_txn.rawTransaction)
+        await provided_web3.eth.wait_for_transaction_receipt(approve_txn_hash)
+    
+    nonce = provided_web3.eth.get_transaction_count(my_address, 'pending')
+    min_tokens_out = int(sell_amount_wei * (1 - slippage))
+    txn = router_contract.functions.swapExactTokensForTokens(
+        sell_amount_wei,
+        min_tokens_out,  # 使用滑点计算的最低卖出数量
+        [to_checksum_address(token_address), to_checksum_address('0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c')],  # Token address and WBNB address
+        my_address,
+        int(time.time()) + 1000
+    ).buildTransaction({
+        'from': my_address,
+        'nonce': nonce,
+        'gas': 4500000,
+        'chainId': 56
+    })
+    estimated_gas = provided_web3.eth.estimate_gas(txn)
+    estimated_gas = int(estimated_gas * 1.1)
+    txn['gas'] = estimated_gas
+    signed_txn = provided_web3.eth.account.sign_transaction(txn, private_key)
+    txn_hash = await provided_web3.eth.send_raw_transaction(signed_txn.rawTransaction)
+    txn_receipt = await provided_web3.eth.wait_for_transaction_receipt(txn_hash)
+    print(f"Sold {provided_web3.from_wei(sell_amount_wei, 'ether')} tokens. Transaction hash: {txn_hash.hex()}")
+    return txn_hash
+
+
+
+
+conn = sqlite3.connect('tokens.db')
+print("Database connected.")  # 连接数据库后打印信息
+c = conn.cursor()
+
+c.execute(
+    'CREATE TABLE IF NOT EXISTS high_risk_tokens (contract_address text, is_honeypot text, buy_tax text, can_take_back_ownership text, is_blacklisted text, is_whitelisted text, is_anti_whale text, cannot_sell_all text)'
+)
+print("high_risk_tokens table created.")  # 创建表后打印信息
+
+c.execute(
+    'CREATE TABLE IF NOT EXISTS safe_tokens (contract_address text)'
+)
+print("safe_tokens table created.")  # 创建表后打印信息
+
+def get_bought_amount_from_receipt(buy_receipt):
+    print("Fetching bought amount from receipt...")  # 开始提取购买量
+    if 'logs' in buy_receipt:
+        for log in buy_receipt['logs']:
+            if 'topics' in log and len(log['topics']) > 0:
+                event_signature_hash = log['topics'][0]
+                if event_signature_hash == web3.keccak(text="Transfer(address,address,uint256)").hex():
+                    bought_amount = web3.toInt(hexstr=log['topics'][2])
+                    print(f"Bought amount: {bought_amount}")  # 提取到购买量后打印出来
+                    return bought_amount
+    return None
+
+import time
+
+async def monitor_and_update_pool_data():
+    print("Starting monitor_and_update_pool_data function...")
+    # 初始化web3实例
+    NODE_URL = os.getenv('NODE_URL')
+    sync_web3 = Web3(HTTPProvider(NODE_URL))
+
+    async with ClientSession() as session:
+        request_counter = 0  # 请求计数器
+        while True:
+            # 每分钟开始时重置请求计数器
+            if request_counter >= 30:
+                request_counter = 0
+
+            print("Fetching new pools...")
+            gecko_data = await get_new_pools(session)
+            
+            tasks = []
+            for token_info in gecko_data['data']:
+                buy_price = await get_token_price(token_info)
+                token_address = token_info['id'].split('_')[1]
+                future = asyncio.Future()
+
+                # 获取最新的nonce和gas_price
+                nonce = sync_web3.eth.get_transaction_count(my_address, "latest")
+                gas_price = await get_gas_price_async()
+
+                tasks.append(await buy_token(provided_web3, token_address, my_address, private_key, gas_price, future))
+
+                # 增加请求计数
+                request_counter += 1
+
+                if request_counter % 30 == 0:
+                    # 达到30次请求，进行延迟
+                    await asyncio.sleep(5)
+                else:
+                    # 不到30次请求，进行短暂延迟
+                    await asyncio.sleep(2)
+
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+
+            for i, result in enumerate(results):
+                if isinstance(result, Exception):
+                    print(f"Task {i} raised exception: {result}")
+                else:
+                    print(f"Task {i} succeeded: {result}")
+            
+            # 添加短暂延迟，以平衡每分钟的请求次数
+            await asyncio.sleep(5)
+
+asyncio.run(monitor_and_update_pool_data())
