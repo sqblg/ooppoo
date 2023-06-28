@@ -615,7 +615,8 @@ async def get_token_price(token_info):
         print("Error: 'id' key not found in token_info or token_info is None")
         return None
 
-    token_address = token_info['id'].split('_')[1]
+    token_address = token_info['attributes']['address']
+
     print(f"Token address: {token_address}")
 
     price_info = await api_get_token_price(token_address)
@@ -930,7 +931,8 @@ async def monitor_and_update_pool_data():
 
             for token_info in gecko_data['data']:
                 buy_price = await get_token_price(token_info)
-                token_address = token_info['id'].split('_')[1]
+                token_address = token_info['attributes']['address']
+
 
                 # 使用NonceManager获取nonce
                 nonce = await nonce_manager.get_nonce()
